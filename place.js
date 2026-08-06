@@ -455,7 +455,8 @@ const PLACE_HTML = `<!doctype html>
   main { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
   .left { flex: 1 1 560px; min-width: 320px; display: flex; flex-direction: column; gap: 10px; }
   #viewport {
-    width: 100%; aspect-ratio: 1; max-height: 78vh; overflow: hidden; position: relative;
+    width: min(100%, 78vh); aspect-ratio: 1; margin: 0 auto;
+    overflow: hidden; position: relative;
     background: #121217; border: 1px solid var(--line); border-radius: 10px;
     touch-action: none; cursor: crosshair;
   }
@@ -684,7 +685,10 @@ const PLACE_HTML = `<!doctype html>
   vp.addEventListener("wheel", function (ev) {
     ev.preventDefault();
     var r = vp.getBoundingClientRect();
-    zoomAt(ev.clientX - r.left, ev.clientY - r.top, ev.deltaY < 0 ? 1.25 : 0.8);
+    // Gentle, magnitude-proportional zoom: ~1.13x per wheel notch, smooth on
+    // trackpads (many small deltas), capped per event.
+    var factor = Math.exp(Math.max(-240, Math.min(240, -ev.deltaY)) * 0.0012);
+    zoomAt(ev.clientX - r.left, ev.clientY - r.top, factor);
   }, { passive: false });
   vp.addEventListener("dblclick", function (ev) {
     var r = vp.getBoundingClientRect();
