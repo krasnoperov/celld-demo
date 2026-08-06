@@ -1,39 +1,49 @@
-# celld-demo — a shared canvas that explains itself
+# celld-demo — place: a forward-only pixel board that explains itself
 
-A collaborative drawing canvas where the UI doubles as a live diagram of the
-technology it runs on: [celld](https://celld.dev), self-hosted, distributed
-Durable Objects by the Deno team.
+An r/place-style pixel board on [celld](https://celld.dev) — self-hosted,
+distributed Durable Objects by the Deno team. Live at
+[canvas.krasnoperov.me](https://canvas.krasnoperov.me/).
 
-Every room is **one Durable Object** — a small single-threaded server with a
-name and a private SQLite database. Next to the canvas, the page shows that
-object introspecting itself in real time:
+One pixel per minute per identity. **Forward-only: nothing is ever erased** —
+every pixel ever placed is a row in a tile's SQLite, forever. The panel next to
+the board is the app introspecting the technology it runs on, in real time.
 
-- **object id** — `idFromName(room)`: same room name, same object, wherever it lives
-- **cold activations** — climbs every time the object is evicted (hibernation,
-  node restart) and wakes back up with its state intact
-- **open sockets / peers** — every browser in the room holds a hibernatable
-  WebSocket into the same object
-- **strokes in sqlite / last durable seq** — each stroke is a row; the ack
-  arrives only after the write is durable in your S3 bucket (RPO = 0)
-- **wire** — the actual JSON frames going over the socket
+## Architecture
 
-Open the same URL in two windows and draw. Kill the node, start it again —
-the room comes back from the bucket, `cold activations` ticks up.
+Write and read paths scale on different axes, so they are separate:
 
-## Why Durable Objects make this trivial
+```
+WRITE (bounded by cooldown, batched)
+  POST /place/px -> Worker -> User DO (atomic cooldown) -> Tile DO
+  The tile buffers placements and flushes them as ONE multi-row insert every
+  ~50ms; callers are acked only after the flush is durable (RPO = 0).
 
-| Concern | Plain Node.js | Durable Object |
-|---|---|---|
-| Ordering concurrent edits | locks / Redis + Lua | object is single-threaded: message order = stroke order |
-| All room clients on one node | sticky sessions + pub/sub | `idFromName(room)` routes everyone to the same object |
-| State survives restarts | separate DB + cache + migrations | the object's SQLite *is* the DB, next to the code |
-| 10 000 idle rooms | 10 000 open sockets hold a process | hibernation: ~0 cost, wakes in ms |
-| Scale to N machines | all of the above × N | start another node with the same `--bucket` |
+READ (frames on the CDN, zero sockets)
+  Tile DOs cut frames on durable alarms: a diff frame ~1/s when dirty, a full
+  frame every 30 diffs. Frames are immutable blobs behind long-lived cache
+  headers; a 1-second manifest points at them. Viewers poll the Cloudflare
+  cache — the origin renders frames at a fixed rate and never sees them.
+```
 
-The whole server is [index.js](index.js): a Worker that routes `/ws/:room` to
-the room's object, and the `Canvas` class (~150 lines) that accepts sockets,
-persists strokes, and broadcasts. The UI is inlined in the same file — the
-deploy is two files.
+- The 512×512 board is **4 Tile objects** of 256×256 — sharding by
+  construction: a pixel war in one corner cannot slow the rest, and a bigger
+  board is just more tiles.
+- The **cooldown is a User object per identity** — a single-threaded
+  check-and-set that cannot be raced. It doesn't care whether its owner is a
+  human or an agent; OAuth slots into the same addressing later.
+- Identity is a random 128-bit cookie for now.
+- `/place/history/:tx/:ty` streams the append-only log (the timelapse feed);
+  inspect mode on the page shows who owns any pixel and since when.
+
+There are deliberately **no formal scalability defects** left in the serving
+path: viewer cost at the origin is O(1) per tile (manifest + frame renders),
+write throughput is one durable flush per tile per 50ms regardless of batch
+size, and per-user state is sharded across User objects. The remaining levers
+(more tiles, more nodes on the same bucket) are configuration, not redesign.
+
+Frame/manifest URLs end in `.bin` deliberately: BIN is on Cloudflare's
+default-cacheable extension list, so the CDN caches them with zero zone
+configuration. A Cache Rule can make the URLs prettier later.
 
 ## Run it
 
@@ -59,54 +69,14 @@ celld deploy . --bucket s3://cells --endpoint http://127.0.0.1:9000
 celld --bucket s3://cells --endpoint http://127.0.0.1:9000 --listen 127.0.0.1:8080
 ```
 
-Open <http://127.0.0.1:8080/> in two windows. Any path is a room:
-`/lobby`, `/friends`, `/whatever` — each one is its own object with its own
-SQLite database.
-
-The code is a standard Wrangler project (`wrangler.jsonc` is the config format
-celld reads), so it also runs unchanged on `wrangler dev` or Cloudflare.
-
-## /place — a forward-only pixel board
-
-The second game on the same objects, r/place-style: a 512×512 board where
-anyone can place **one pixel per minute**, and nothing is ever erased.
-
-- The board is **4 Tile objects** of 256×256 — real sharding from day one. Each
-  tile keeps the current state as a 4-bit bitmap and every placement ever made
-  as a row in its own SQLite (`/place/history/:tx/:ty` is the timelapse feed).
-- The **cooldown is a User object per identity** — an atomic check-and-set in a
-  single-threaded object, so it cannot be raced. It doesn't care whether its
-  owner is a human or an agent.
-- Placements go over HTTP POST (the write path); live updates arrive over one
-  WebSocket per tile. At scale the update transport swaps to CDN-served frames
-  without touching the write path.
-- Identity is a random 128-bit cookie for now; OAuth slots into the same
-  User-object addressing later.
-
-Inspect mode shows the provenance of any pixel: who placed it and when.
-
-## Optional: an agent as a peer
-
-[agent/](agent/) contains a Claude-powered drawing partner. It is deliberately
-*not* special: just another WebSocket client of the same object, speaking the
-same protocol with `?role=agent`. It watches strokes and chat, and draws back.
-
-```bash
-cd agent && npm install
-ANTHROPIC_API_KEY=... CANVAS_URL=ws://127.0.0.1:8080 node agent.mjs lobby
-```
-
-Not used on the public deployment.
+Open <http://127.0.0.1:8080/>. The code is a standard Wrangler project
+(`wrangler.jsonc` is the config format celld reads), so it also runs unchanged
+on `wrangler dev` or Cloudflare.
 
 ## Security notes
 
-- The server never executes anything a client sends: peers exchange small JSON
-  data frames; every field is validated, clamped, and length-capped server-side.
-- Per-socket rate limiting, per-room socket cap (32), history bounded by rows
-  (2000) and bytes (4 MB, oldest trimmed), strict CSP on the page.
-- Only a real WebSocket upgrade instantiates a room object; plain requests to
-  `/ws/*` are rejected in the Worker before touching a Durable Object.
+- The server never executes anything a client sends: every field of every
+  request is validated, clamped, and length-capped server-side.
+- Cooldown per identity, a flood floor per tile, strict CSP on the page.
 - The node binds to localhost; expose it through a reverse proxy (Caddy/nginx)
-  that terminates TLS and proxies WebSockets. Room creation is open by design
-  (any URL path is a room) — add proxy-level rate limiting if that matters
-  to you.
+  that terminates TLS.

@@ -1,8 +1,0 @@
-{
-  "name": "canvas-agent",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.70.0"
-  }
-}

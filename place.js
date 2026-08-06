@@ -1,13 +1,23 @@
 // place — an r/place-style pixel board on Durable Objects. Forward-only:
 // pixels are never wiped, every placement is a row in a tile's SQLite forever.
 //
-// Architecture (matches the design doc):
-// - the 512x512 board is 4 Tile objects of 256x256 — real sharding from day one
-// - a User object per identity enforces the cooldown atomically (tryPlace)
-// - placements go over HTTP POST (the write path); live updates over WS per
-//   tile (ladder tier 1; CDN frames replace this transport at scale)
-// - identity is a random 128-bit cookie for now; the User object doesn't care
-//   whether its owner is a human, an agent, or a future OAuth login.
+// Architecture (the "correct" tier from the design doc, on by default):
+//
+//   WRITE PATH — bounded by cooldown, batched:
+//     POST /place/px -> Worker -> User DO (atomic cooldown) -> Tile DO.
+//     The tile buffers placements and flushes them as ONE multi-row insert
+//     every ~50ms; callers are acked only after the flush is durable.
+//     This removes the per-write flush ceiling without weakening RPO=0.
+//
+//   READ PATH — frames on the CDN, zero sockets:
+//     Each tile cuts frames on a durable alarm: a diff frame (~1s cadence,
+//     only when dirty) and a full frame every FULL_EVERY diffs. Frames are
+//     immutable blobs served with long-lived cache headers; a tiny manifest
+//     (edge TTL 1s) points at them. A million viewers poll the Cloudflare
+//     cache; the origin renders frames at a fixed rate and never sees them.
+//
+// One User object per identity owns the cooldown. It doesn't care whether
+// its owner is a human, an agent, or a future OAuth login.
 
 export const TILE = 256;          // pixels per tile side
 export const TILES = 2;           // board is TILES x TILES tiles
@@ -20,7 +30,14 @@ const PALETTE = [
   "#0083c7", "#0000ea", "#cf6ee4", "#820080",
 ];
 const TILE_RATE = 30;             // placements/s per tile (flood floor)
-const BITMAP_SAVE_EVERY = 8;      // persist bitmap every N placements
+const FLUSH_MS = 50;              // write batching window
+const FRAME_MS = 1000;            // min interval between diff frames
+const FULL_EVERY = 30;            // cut a full frame every N diffs
+const KEEP_DIFFS = 90;            // serving window; older viewers refetch full
+
+// Frame wire format (little-endian):
+//   full frame: 32768 bytes, one nibble per pixel, row-major
+//   diff frame: u32 per pixel: (idx & 0xffff) | (color << 16)
 
 // --- Tile: one object per 256x256 board section -----------------------------
 
@@ -30,6 +47,7 @@ export class Tile {
     this.bornAt = Date.now();
     this.activations = null;
     this.rate = { ts: 0, n: 0 };
+    this.pending = [];            // buffered placements awaiting the next flush
     this.state.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS pixels (
          seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,8 +57,8 @@ export class Tile {
     );
   }
 
-  // Bitmap = current board section, one nibble per pixel (32 KB). Persisted
-  // every N placements; on activation the tail is replayed from SQLite.
+  // Bitmap = current section state, one nibble per pixel (32 KB). Saved with
+  // every flush; on activation any tail beyond the save is replayed from SQL.
   init() {
     return (this.initing ??= (async () => {
       this.activations = ((await this.state.storage.get("activations")) ?? 0) + 1;
@@ -48,12 +66,15 @@ export class Tile {
       const saved = await this.state.storage.get("bitmap");
       this.bitmap = saved?.bytes
         ? new Uint8Array(saved.bytes) : new Uint8Array((TILE * TILE) / 2);
-      this.savedSeq = saved?.seq ?? 0;
+      this.seq = saved?.seq ?? 0;
       const tail = this.state.storage.sql
-        .exec("SELECT x, y, c FROM pixels WHERE seq > ? ORDER BY seq", this.savedSeq)
+        .exec("SELECT seq, x, y, c FROM pixels WHERE seq > ? ORDER BY seq", this.seq)
         .toArray();
-      for (const p of tail) this.setNibble(p.x, p.y, p.c);
-      this.unsaved = tail.length;
+      for (const p of tail) { this.setNibble(p.x, p.y, p.c); this.seq = p.seq; }
+      // frames: { list: [{seq, from, kind}], fullSeq, lastFrameAt }
+      this.frames = (await this.state.storage.get("frames"))
+        ?? { list: [], fullSeq: -1, lastFrameAt: 0 };
+      if (this.frames.fullSeq === -1) await this.cutFullFrame();  // genesis frame
     })());
   }
 
@@ -65,21 +86,105 @@ export class Tile {
       : (this.bitmap[b] & 0xf0) | c;
   }
 
-  async saveBitmap(seq) {
-    await this.state.storage.put("bitmap", { seq, bytes: this.bitmap.buffer.slice(0) });
-    this.savedSeq = seq;
-    this.unsaved = 0;
+  // --- write path ----------------------------------------------------------
+
+  // Batching under celld's deadlock guard: a handler may only await work it
+  // owns, so every request sleeps out the batching window on its own timer;
+  // whichever wakes first flushes the whole buffer, the rest find their row
+  // already assigned. One durable unit per window either way.
+  async place(x, y, c, uid) {
+    const entry = { x, y, c, uid, ts: Date.now(), seq: null };
+    this.pending.push(entry);
+    await new Promise((r) => setTimeout(r, FLUSH_MS));
+    if (entry.seq === null) await this.flush();
+    return entry.seq;
+  }
+
+  async flush() {
+    const batch = this.pending;
+    this.pending = [];
+    if (batch.length === 0) return;
+
+    // One durable unit for the whole batch: a single multi-row INSERT.
+    const values = batch.map(() => "(?, ?, ?, ?, ?)").join(", ");
+    const args = batch.flatMap((p) => [p.x, p.y, p.c, p.uid, p.ts]);
+    const rows = this.state.storage.sql.exec(
+      `INSERT INTO pixels (x, y, c, uid, ts) VALUES ${values} RETURNING seq`,
+      ...args,
+    ).toArray();
+    batch.forEach((p, i) => {
+      this.setNibble(p.x, p.y, p.c);
+      p.seq = rows[i].seq;
+    });
+    this.seq = rows[rows.length - 1].seq;
+    await this.state.storage.put("bitmap", { seq: this.seq, bytes: this.bitmap.buffer.slice(0) });
+
+    // Arm the frame alarm unless one is already pending. The alarm is durable:
+    // it survives hibernation, so the last pixels always make it into a frame.
+    if ((await this.state.storage.getAlarm()) === null) {
+      await this.state.storage.setAlarm(Date.now() + FRAME_MS);
+    }
+  }
+
+  // --- read path: frame cutting on a durable alarm -------------------------
+
+  async alarm() {
+    await this.init();
+    if (this.seq > this.lastFrameSeq()) await this.cutDiffFrame();
+    if (this.pending.length > 0 || this.seq > this.lastFrameSeq()) {
+      await this.state.storage.setAlarm(Date.now() + FRAME_MS);
+    }
+  }
+
+  lastFrameSeq() {
+    const l = this.frames.list;
+    return l.length ? l[l.length - 1].seq : this.frames.fullSeq;
+  }
+
+  async cutDiffFrame() {
+    const from = this.lastFrameSeq();
+    const rows = this.state.storage.sql.exec(
+      "SELECT x, y, c FROM pixels WHERE seq > ? ORDER BY seq", from).toArray();
+    if (rows.length === 0) return;
+    const buf = new Uint32Array(rows.length);
+    rows.forEach((p, i) => { buf[i] = (p.y * TILE + p.x) | (p.c << 16); });
+    await this.state.storage.put(`f:${this.seq}`, buf.buffer);
+    this.frames.list.push({ seq: this.seq, from, kind: "diff" });
+    this.frames.lastFrameAt = Date.now();
+
+    const diffsSinceFull = this.frames.list.filter((f) => f.seq > this.frames.fullSeq).length;
+    if (diffsSinceFull >= FULL_EVERY) await this.cutFullFrame();
+    await this.pruneFrames();
+    await this.state.storage.put("frames", this.frames);
+  }
+
+  async cutFullFrame() {
+    await this.state.storage.put(`f:${this.seq}:full`, this.bitmap.buffer.slice(0));
+    this.frames.fullSeq = this.seq;
+    this.frames.lastFrameAt = Date.now();
+    await this.state.storage.put("frames", this.frames);
+  }
+
+  async pruneFrames() {
+    // Keep the serving window; a viewer older than it refetches the full frame.
+    while (this.frames.list.length > KEEP_DIFFS) {
+      const old = this.frames.list.shift();
+      await this.state.storage.delete(`f:${old.seq}`);
+    }
   }
 
   async meta() {
-    await this.init();
     const row = this.state.storage.sql
-      .exec("SELECT COUNT(*) AS n, COALESCE(MAX(seq), 0) AS maxseq FROM pixels").one();
+      .exec("SELECT COUNT(*) AS n FROM pixels").one();
     return {
       bornAt: this.bornAt, now: Date.now(), activations: this.activations,
-      sockets: this.state.getWebSockets().length, pixels: row.n, maxseq: row.maxseq,
+      pixels: row.n, seq: this.seq,
+      frame: this.lastFrameSeq(), full: this.frames.fullSeq,
+      frameAge: this.frames.lastFrameAt ? Date.now() - this.frames.lastFrameAt : null,
     };
   }
+
+  // --- plumbing ------------------------------------------------------------
 
   async fetch(request) {
     await this.init();
@@ -90,14 +195,31 @@ export class Tile {
       if (now - this.rate.ts >= 1000) this.rate = { ts: now, n: 0 };
       if (++this.rate.n > TILE_RATE) return json({ ok: false, error: "tile busy" }, 429);
       const { x, y, c, uid } = await request.json();
-      const { seq } = this.state.storage.sql.exec(
-        "INSERT INTO pixels (x, y, c, uid, ts) VALUES (?, ?, ?, ?, ?) RETURNING seq",
-        x, y, c, uid, now,
-      ).one();
-      this.setNibble(x, y, c);
-      if (++this.unsaved >= BITMAP_SAVE_EVERY) await this.saveBitmap(seq);
-      this.broadcast({ type: "px", x, y, c, seq });
+      const seq = await this.place(x, y, c, uid);
       return json({ ok: true, seq });
+    }
+
+    if (url.pathname === "/manifest") {
+      // Everything a cold or warm viewer needs: which full frame to load and
+      // which diffs to chain on top. Meta rides along for the UI panel.
+      return json({
+        seq: this.lastFrameSeq(),
+        full: this.frames.fullSeq,
+        diffs: this.frames.list
+          .filter((f) => f.seq > this.frames.fullSeq || f.from >= this.frames.fullSeq)
+          .map((f) => ({ seq: f.seq, from: f.from })),
+        meta: await this.meta(),
+      });
+    }
+
+    let m = url.pathname.match(/^\/frame\/(\d+)(:full)?$/);
+    if (m) {
+      const key = `f:${m[1]}${m[2] ?? ""}`;
+      const bytes = await this.state.storage.get(key);
+      if (!bytes) return new Response("frame expired", { status: 404 });
+      return new Response(bytes, {
+        headers: { "content-type": "application/octet-stream" },
+      });
     }
 
     if (url.pathname === "/who") {
@@ -118,38 +240,7 @@ export class Tile {
       return json(rows);
     }
 
-    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
-      if (this.state.getWebSockets().length >= 512) {
-        return new Response("tile full", { status: 429 });
-      }
-      const pair = new WebSocketPair();
-      this.state.acceptWebSocket(pair[0]);
-      pair[0].send(JSON.stringify({
-        type: "snapshot",
-        seq: this.savedSeq + this.unsaved,
-        bitmap: b64(this.bitmap),
-        meta: await this.meta(),
-      }));
-      return new Response(null, { status: 101, webSocket: pair[1] });
-    }
-
     return new Response("not found", { status: 404 });
-  }
-
-  async webSocketMessage(ws, raw) {
-    if (typeof raw !== "string" || raw.length > 256) return;
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
-    if (msg.type === "stats") {
-      ws.send(JSON.stringify({ type: "stats", meta: await this.meta() }));
-    }
-  }
-
-  broadcast(msg) {
-    const s = JSON.stringify(msg);
-    for (const sock of this.state.getWebSockets()) {
-      try { sock.send(s); } catch {}
-    }
   }
 }
 
@@ -184,19 +275,23 @@ export class User {
 
 // --- Worker-side routing for /place* ----------------------------------------
 
+// Frame and manifest URLs use the .bin extension deliberately: BIN is on
+// Cloudflare's default-cacheable extension list, so the CDN caches them with
+// zero zone configuration (a Cache Rule can make the URLs prettier later).
+
 export async function handlePlace(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  if (path === "/place" || path === "/place/") {
-    const { uid, setCookie } = identity(request);
+  if (path === "/" || path === "/place" || path === "/place/") {
+    const { setCookie } = identity(request);
     const headers = {
       "content-type": "text/html; charset=utf-8",
       "x-content-type-options": "nosniff",
       "referrer-policy": "no-referrer",
       "content-security-policy":
         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
-        "connect-src 'self' ws: wss:; img-src 'self' data:; base-uri 'none'; form-action 'none'",
+        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'",
     };
     if (setCookie) headers["set-cookie"] = setCookie;
     return new Response(PLACE_HTML, { headers });
@@ -234,13 +329,31 @@ export async function handlePlace(request, env) {
     return withCookie(json({ ...me, uid: uid.slice(0, 8) }), setCookie);
   }
 
-  // GET /place/ws/:tx/:ty — live pixel stream for one tile
-  let m = path.match(/^\/place\/ws\/(\d)\/(\d)$/);
+  // GET /place/manifest/:tx/:ty.bin — tiny pointer, edge-cached for 1s
+  let m = path.match(/^\/place\/manifest\/(\d)\/(\d)\.bin$/);
   if (m && +m[1] < TILES && +m[2] < TILES) {
-    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-      return new Response("websocket upgrade required", { status: 426 });
-    }
-    return env.TILE.get(env.TILE.idFromName(`t:${m[1]},${m[2]}`)).fetch(request);
+    const tile = env.TILE.get(env.TILE.idFromName(`t:${m[1]},${m[2]}`));
+    const manifest = await (await tile.fetch("https://do/manifest")).text();
+    return new Response(manifest, {
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "public, max-age=0, s-maxage=1, stale-while-revalidate=5",
+      },
+    });
+  }
+
+  // GET /place/frame/:tx/:ty/:seq[.full].bin — immutable, cached ~forever
+  m = path.match(/^\/place\/frame\/(\d)\/(\d)\/(\d+)(\.full)?\.bin$/);
+  if (m && +m[1] < TILES && +m[2] < TILES) {
+    const tile = env.TILE.get(env.TILE.idFromName(`t:${m[1]},${m[2]}`));
+    const resp = await tile.fetch(`https://do/frame/${m[3]}${m[4] ? ":full" : ""}`);
+    if (!resp.ok) return resp;
+    return new Response(resp.body, {
+      headers: {
+        "content-type": "application/octet-stream",
+        "cache-control": "public, max-age=31536000, immutable",
+      },
+    });
   }
 
   // GET /place/who?x=&y= — provenance of one pixel
@@ -275,7 +388,7 @@ function identity(request) {
   const uid = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
   return {
     uid,
-    setCookie: `pid=${uid}; Path=/place; Max-Age=31536000; HttpOnly; SameSite=Lax; Secure`,
+    setCookie: `pid=${uid}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax; Secure`,
   };
 }
 
@@ -290,14 +403,6 @@ function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status, headers: { "content-type": "application/json" },
   });
-}
-
-function b64(bytes) {
-  let s = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-  }
-  return btoa(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -345,7 +450,6 @@ const PLACE_HTML = `<!doctype html>
     border-radius: 3px;
   }
   .pal.on { outline: 2px solid #fff; outline-offset: 1px; }
-  .bar .sep { width: 10px; }
   button.txt {
     background: transparent; color: var(--mut); border: 1px solid var(--line);
     border-radius: 7px; padding: 4px 10px; cursor: pointer; font: inherit;
@@ -371,11 +475,15 @@ const PLACE_HTML = `<!doctype html>
   .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; }
   .kv dt { color: var(--mut); }
   .kv dd { color: var(--fg); text-align: right; }
-  .kv dd.hot { color: var(--hot); }
   table { border-collapse: collapse; width: 100%; font-size: 12px; }
   th { text-align: left; color: var(--dim); font-weight: 600; padding: 2px 8px 4px 0; }
   td { color: var(--mut); padding: 2px 8px 2px 0; }
   td:first-child { color: var(--fg); }
+  #pipe { height: 150px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+  #pipe div { flex: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #797985; }
+  #pipe b { color: #bcbcc8; font-weight: 600; }
+  #pipe .hit { color: #7fd07f; }
+  #pipe .miss { color: #e8b45a; }
   .note { color: var(--dim); font-size: 12px; }
   .note p { margin-bottom: 7px; }
   .note p:last-child { margin-bottom: 0; }
@@ -416,22 +524,29 @@ const PLACE_HTML = `<!doctype html>
     <div class="card">
       <h2>board &mdash; 4 tile objects</h2>
       <table id="tiles">
-        <tr><th>tile</th><th>px</th><th>socks</th><th>wakes</th><th>live</th></tr>
+        <tr><th>tile</th><th>px</th><th>frame</th><th>wakes</th><th>cdn</th></tr>
       </table>
     </div>
+    <div class="card">
+      <h2>frame pipeline</h2>
+      <div id="pipe"></div>
+    </div>
     <div class="card note">
-      <p><em>each 256&times;256 tile is its own durable object</em> with its own SQLite:
-      the board shards by construction, a pixel war in one corner can't slow the rest.</p>
-      <p><em>your cooldown is its own object too</em> &mdash; a single-threaded
-      check-and-set, so it can't be raced. it doesn't care if you're a human or an agent.</p>
+      <p><em>no sockets.</em> this page polls a 1-second manifest and fetches immutable
+      frame blobs &mdash; both cached by the CDN, so viewers cost the origin ~nothing,
+      however many there are. the cdn column shows where each response came from.</p>
+      <p><em>frames are cut by durable alarms.</em> each 256&times;256 tile is its own
+      object with its own SQLite; it batches writes into single durable flushes and
+      renders a diff frame ~1/s, a full frame every 30 diffs.</p>
       <p><em>forward-only:</em> every pixel ever placed is a row, forever. inspect mode
       shows who owns any pixel and since when.</p>
     </div>
   </aside>
 </main>
 <footer>
-  same durable objects, different game: the freehand
-  <a href="/">shared canvas</a> lives next door &middot;
+  a meta-demo: the panel on the right is the app introspecting the technology
+  it runs on &mdash; <a href="https://celld.dev" rel="noopener">celld</a>,
+  self-hosted durable objects &middot;
   <a href="https://github.com/krasnoperov/celld-demo" rel="noopener">source</a>
 </footer>
 <script>
@@ -449,6 +564,16 @@ const PLACE_HTML = `<!doctype html>
   function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
   function note(html) { toast.innerHTML = html; }
 
+  var pipe = el("pipe");
+  function logPipe(label, detail, cls) {
+    var d = document.createElement("div");
+    d.innerHTML = "<b>" + esc(label) + "</b> " + esc(detail || "") +
+      (cls ? ' <span class="' + cls + '">' + cls.toUpperCase() + "</span>" : "");
+    pipe.appendChild(d);
+    while (pipe.children.length > 50) pipe.removeChild(pipe.firstChild);
+    pipe.scrollTop = pipe.scrollHeight;
+  }
+
   // --- palette -------------------------------------------------------------
   var pal = el("palette");
   PALETTE.forEach(function (hex, i) {
@@ -465,26 +590,30 @@ const PLACE_HTML = `<!doctype html>
 
   // --- board rendering -----------------------------------------------------
   function px(x, y, c) { cx.fillStyle = PALETTE[c]; cx.fillRect(x, y, 1, 1); }
-  function drawBitmap(tx, ty, b64s) {
-    var bin = atob(b64s);
-    for (var i = 0; i < bin.length; i++) {
-      var byte = bin.charCodeAt(i);
+  function drawFull(tx, ty, bytes) {
+    var u8 = new Uint8Array(bytes);
+    for (var i = 0; i < u8.length; i++) {
       var p = i * 2;
       var x0 = tx * TILE + (p % TILE), y0 = ty * TILE + Math.floor(p / TILE);
-      px(x0, y0, byte & 15);
-      px(x0 + 1, y0, byte >> 4);
+      px(x0, y0, u8[i] & 15);
+      px(x0 + 1, y0, u8[i] >> 4);
     }
+  }
+  function drawDiff(tx, ty, bytes) {
+    var u32 = new Uint32Array(bytes);
+    for (var i = 0; i < u32.length; i++) {
+      var idx = u32[i] & 0xffff, c = (u32[i] >> 16) & 15;
+      px(tx * TILE + (idx % TILE), ty * TILE + Math.floor(idx / TILE), c);
+    }
+    return u32.length;
   }
 
   // --- zoom & pan ----------------------------------------------------------
-  function fitScale() {
-    return vp.clientWidth / BOARD;
-  }
+  function fitScale() { return vp.clientWidth / BOARD; }
   function apply() {
     var f = fitScale() * scale;
-    var maxo = 0, mino = vp.clientWidth - BOARD * f;
-    ox = Math.min(maxo, Math.max(mino, ox));
-    oy = Math.min(maxo, Math.max(Math.min(0, vp.clientHeight - BOARD * f), oy));
+    ox = Math.min(0, Math.max(vp.clientWidth - BOARD * f, ox));
+    oy = Math.min(0, Math.max(Math.min(0, vp.clientHeight - BOARD * f), oy));
     cv.style.transform = "translate(" + ox + "px," + oy + "px) scale(" + f + ")";
   }
   function zoomAt(cxp, cyp, factor) {
@@ -606,8 +735,7 @@ const PLACE_HTML = `<!doctype html>
     nextAt = me.next;
   });
 
-  // --- live tiles ----------------------------------------------------------
-  var proto = location.protocol === "https:" ? "wss://" : "ws://";
+  // --- CDN frame loop ------------------------------------------------------
   var tileRows = {};
   var tbl = el("tiles");
   function tileRow(tx, ty) {
@@ -620,40 +748,64 @@ const PLACE_HTML = `<!doctype html>
     }
     return tileRows[key];
   }
-  function connectTile(tx, ty) {
-    var row = tileRow(tx, ty);
-    var retry = 0;
-    function go() {
-      var ws = new WebSocket(proto + location.host + "/place/ws/" + tx + "/" + ty);
-      ws.onopen = function () { retry = 0; row[4].textContent = "live"; };
-      ws.onclose = function () {
-        row[4].textContent = "re\\u2026";
-        setTimeout(go, Math.min(1000 * ++retry, 5000));
-      };
-      ws.onmessage = function (ev) {
-        var m = JSON.parse(ev.data);
-        if (m.type === "snapshot") {
-          drawBitmap(tx, ty, m.bitmap);
-          applyMeta(m.meta);
-        } else if (m.type === "px") {
-          px(tx * TILE + m.x, ty * TILE + m.y, m.c);
-          row[1].textContent = +row[1].textContent + 1 || m.seq;
-        } else if (m.type === "stats") {
-          applyMeta(m.meta);
-        }
-      };
-      setInterval(function () {
-        if (ws.readyState === 1) ws.send(JSON.stringify({ type: "stats" }));
-      }, 20000);
-      function applyMeta(meta) {
-        row[1].textContent = meta.pixels;
-        row[2].textContent = meta.sockets;
-        row[3].textContent = meta.activations;
-      }
-    }
-    go();
+  function cdnStatus(resp) {
+    var s = resp.headers.get("cf-cache-status");
+    return s ? s.toLowerCase() : null;
   }
-  for (var ty = 0; ty < TILES; ty++) for (var tx = 0; tx < TILES; tx++) connectTile(tx, ty);
+  function frameUrl(tx, ty, seq, full) {
+    return "/place/frame/" + tx + "/" + ty + "/" + seq + (full ? ".full" : "") + ".bin";
+  }
+
+  function tileLoop(tx, ty) {
+    var row = tileRow(tx, ty);
+    var mySeq = -1;
+    function tick() {
+      fetch("/place/manifest/" + tx + "/" + ty + ".bin", { cache: "no-store" })
+        .then(function (r) {
+          var st = cdnStatus(r);
+          return r.json().then(function (man) { return { man: man, st: st }; });
+        })
+        .then(function (res) {
+          var man = res.man;
+          row[1].textContent = man.meta.pixels;
+          row[2].textContent = man.seq;
+          row[3].textContent = man.meta.activations;
+          if (res.st) row[4].textContent = res.st;
+          if (man.seq === mySeq) return;
+
+          // Cold, or fell out of the diff window -> load the full frame first.
+          var chain = man.diffs.filter(function (d) { return d.from >= mySeq && d.seq > mySeq; });
+          var contiguous = chain.length && chain[0].from === mySeq;
+          var start = (mySeq >= 0 && contiguous)
+            ? Promise.resolve(mySeq)
+            : fetch(frameUrl(tx, ty, man.full, true))
+                .then(function (r) {
+                  logPipe("t:" + tx + "," + ty, "full frame seq " + man.full + " (32KB)", cdnStatus(r));
+                  return r.arrayBuffer();
+                })
+                .then(function (b) { drawFull(tx, ty, b); return man.full; });
+
+          start.then(function (at) {
+            var todo = man.diffs.filter(function (d) { return d.from >= at; });
+            return todo.reduce(function (p, d) {
+              return p.then(function () {
+                return fetch(frameUrl(tx, ty, d.seq, false)).then(function (r) {
+                  var st = cdnStatus(r);
+                  return r.arrayBuffer().then(function (b) {
+                    var n = drawDiff(tx, ty, b);
+                    logPipe("t:" + tx + "," + ty, "diff " + d.from + "\\u2192" + d.seq + " (" + n + "px)", st);
+                  });
+                });
+              });
+            }, Promise.resolve()).then(function () { mySeq = man.seq; });
+          });
+        })
+        .catch(function () {})
+        .then(function () { setTimeout(tick, 1000); });
+    }
+    tick();
+  }
+  for (var ty = 0; ty < TILES; ty++) for (var tx = 0; tx < TILES; tx++) tileLoop(tx, ty);
   apply();
   window.addEventListener("resize", apply);
 })();
