@@ -5,7 +5,14 @@
   "main": "index.js",
   "compatibility_date": "2026-01-01",
   "durable_objects": {
-    "bindings": [{ "name": "CANVAS", "class_name": "Canvas" }]
+    "bindings": [
+      { "name": "CANVAS", "class_name": "Canvas" },
+      { "name": "TILE", "class_name": "Tile" },
+      { "name": "USER", "class_name": "User" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Canvas"] }]
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Canvas"] },
+    { "tag": "v2", "new_sqlite_classes": ["Tile", "User"] }
+  ]
 }

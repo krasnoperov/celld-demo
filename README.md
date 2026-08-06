@@ -66,6 +66,25 @@ SQLite database.
 The code is a standard Wrangler project (`wrangler.jsonc` is the config format
 celld reads), so it also runs unchanged on `wrangler dev` or Cloudflare.
 
+## /place — a forward-only pixel board
+
+The second game on the same objects, r/place-style: a 512×512 board where
+anyone can place **one pixel per minute**, and nothing is ever erased.
+
+- The board is **4 Tile objects** of 256×256 — real sharding from day one. Each
+  tile keeps the current state as a 4-bit bitmap and every placement ever made
+  as a row in its own SQLite (`/place/history/:tx/:ty` is the timelapse feed).
+- The **cooldown is a User object per identity** — an atomic check-and-set in a
+  single-threaded object, so it cannot be raced. It doesn't care whether its
+  owner is a human or an agent.
+- Placements go over HTTP POST (the write path); live updates arrive over one
+  WebSocket per tile. At scale the update transport swaps to CDN-served frames
+  without touching the write path.
+- Identity is a random 128-bit cookie for now; OAuth slots into the same
+  User-object addressing later.
+
+Inspect mode shows the provenance of any pixel: who placed it and when.
+
 ## Optional: an agent as a peer
 
 [agent/](agent/) contains a Claude-powered drawing partner. It is deliberately

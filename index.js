@@ -14,6 +14,9 @@
 // Clients exchange small JSON data frames; every field is validated and
 // clamped server-side; the only mutable state is this object's SQLite.
 
+import { Tile, User, handlePlace } from "./place.js";
+export { Tile, User };
+
 const ROOM_W = 1000;
 const ROOM_H = 700;
 const MAX_FRAME = 32 * 1024;        // raw inbound message bytes
@@ -206,6 +209,9 @@ function sanitizeStroke(msg, actor, role) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/place" || url.pathname.startsWith("/place/")) {
+      return handlePlace(request, env);
+    }
     const ws = url.pathname.match(/^\/ws\/([\w-]{1,64})$/);
     if (ws) {
       // Only a real upgrade reaches (and thereby instantiates) the object —
