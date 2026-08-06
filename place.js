@@ -244,37 +244,110 @@ export class Tile {
   }
 }
 
-// --- User: one object per identity; the cooldown lives here -----------------
+// --- User: cooldown SHARDS, not an object per person -------------------------
+//
+// A dedicated object per user is the wrong granularity for 16 bytes of state:
+// every placement would durably write an unbatchable one-row database (1 Class
+// A op each on R2), and a viral peak makes "unique users of the last 5 min"
+// resident in RAM. Instead the cooldown lives in USER_SHARDS objects addressed
+// by hash(uid): atomicity is unchanged (a shard is single-threaded), writes
+// batch exactly like the tile's, rejects don't write at all, and the object
+// population is a constant. Per-user objects come back later, opt-in, for the
+// features that earn them (standing orders, agents) — not for a timestamp.
+//
+// The class keeps the name `User` so celld migrations stay untouched.
+
+export const USER_SHARDS = 64;
+
+export function shardFor(uid) {
+  let h = 0x811c9dc5;                       // FNV-1a over the uid hex
+  for (let i = 0; i < uid.length; i++) {
+    h ^= uid.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `s:${(h >>> 0) % USER_SHARDS}`;
+}
 
 export class User {
   constructor(state, env) {
     this.state = state;
+    this.pending = [];                       // accepted placements awaiting flush
+    this.pendingNext = new Map();            // uid -> nextAt not yet durable
+    this.state.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS users (
+         uid TEXT PRIMARY KEY,
+         nextAt INTEGER NOT NULL,
+         placed INTEGER NOT NULL
+       )`,
+    );
+  }
+
+  row(uid) {
+    return this.state.storage.sql
+      .exec("SELECT nextAt, placed FROM users WHERE uid = ?", uid)
+      .toArray()[0];
+  }
+
+  // Accept/reject is decided synchronously against SQL + the in-flight
+  // overlay, so two requests for the same uid in one batching window cannot
+  // both pass. Accepted entries flush as ONE upsert per window (same
+  // own-timer pattern as the tile — see its comment on the deadlock guard).
+  async tryPlace(uid) {
+    const now = Date.now();
+    const eff = this.pendingNext.get(uid) ?? this.row(uid)?.nextAt ?? 0;
+    if (now < eff) return { ok: false, next: eff };      // reject: zero writes
+    const next = now + COOLDOWN_MS;
+    this.pendingNext.set(uid, next);
+    const entry = { uid, next, done: false };
+    this.pending.push(entry);
+    await new Promise((r) => setTimeout(r, FLUSH_MS));
+    if (!entry.done) await this.flush();
+    const placed = this.row(uid)?.placed ?? 1;
+    return { ok: true, next, placed };
+  }
+
+  async flush() {
+    const batch = this.pending;
+    this.pending = [];
+    if (batch.length === 0) return;
+    const values = batch.map(() => "(?, ?, 1)").join(", ");
+    const args = batch.flatMap((p) => [p.uid, p.next]);
+    this.state.storage.sql.exec(
+      `INSERT INTO users (uid, nextAt, placed) VALUES ${values}
+       ON CONFLICT(uid) DO UPDATE SET
+         nextAt = excluded.nextAt, placed = users.placed + 1`,
+      ...args,
+    );
+    // One durable barrier for the whole window.
+    await this.state.storage.put("seq", ((await this.state.storage.get("seq")) ?? 0) + 1);
+    for (const p of batch) {
+      p.done = true;
+      if (this.pendingNext.get(p.uid) === p.next) this.pendingNext.delete(p.uid);
+    }
   }
 
   async fetch(request) {
     const url = new URL(request.url);
+    const uid = url.searchParams.get("uid") ?? "";
+    if (!/^[0-9a-f]{32}$/.test(uid)) return json({ ok: false }, 400);
+
     if (url.pathname === "/try" && request.method === "POST") {
-      const now = Date.now();
-      const nextAt = (await this.state.storage.get("nextAt")) ?? 0;
-      if (now < nextAt) return json({ ok: false, next: nextAt });
-      const placed = ((await this.state.storage.get("placed")) ?? 0) + 1;
-      // Single-threaded object: this read-check-write cannot race.
-      await this.state.storage.put("nextAt", now + COOLDOWN_MS);
-      await this.state.storage.put("placed", placed);
-      return json({ ok: true, next: now + COOLDOWN_MS, placed });
+      return json(await this.tryPlace(uid));
     }
     // Refund: the cooldown was consumed but the pixel never landed (e.g. the
-    // tile's owner was mid-failover). Give the minute back.
+    // tile's owner was mid-failover). Give the minute back. Rare -> unbatched.
     if (url.pathname === "/refund" && request.method === "POST") {
-      await this.state.storage.put("nextAt", 0);
-      const placed = (await this.state.storage.get("placed")) ?? 0;
-      await this.state.storage.put("placed", Math.max(0, placed - 1));
+      this.pendingNext.delete(uid);
+      this.state.storage.sql.exec(
+        "UPDATE users SET nextAt = 0, placed = MAX(0, placed - 1) WHERE uid = ?", uid);
+      await this.state.storage.put("seq", ((await this.state.storage.get("seq")) ?? 0) + 1);
       return json({ ok: true });
     }
     if (url.pathname === "/me") {
+      const r = this.row(uid);
       return json({
-        next: (await this.state.storage.get("nextAt")) ?? 0,
-        placed: (await this.state.storage.get("placed")) ?? 0,
+        next: this.pendingNext.get(uid) ?? r?.nextAt ?? 0,
+        placed: r?.placed ?? 0,
       });
     }
     return new Response("not found", { status: 404 });
@@ -314,8 +387,8 @@ export async function handlePlace(request, env) {
     if (x < 0 || x >= BOARD || y < 0 || y >= BOARD || c < 0 || c >= PALETTE.length) {
       return json({ ok: false, error: "out of range" }, 400);
     }
-    const user = env.USER.get(env.USER.idFromName(uid));
-    const verdict = await (await user.fetch("https://do/try", { method: "POST" })).json();
+    const user = env.USER.get(env.USER.idFromName(shardFor(uid)));
+    const verdict = await (await user.fetch(`https://do/try?uid=${uid}`, { method: "POST" })).json();
     if (!verdict.ok) {
       return withCookie(json({ ok: false, cooldown: true, next: verdict.next }, 429), setCookie);
     }
@@ -333,7 +406,7 @@ export async function handlePlace(request, env) {
     } catch {
       // Tile unreachable (node failover, ~seconds). The cooldown was already
       // consumed — hand the minute back before reporting the outage.
-      await user.fetch("https://do/refund", { method: "POST" }).catch(() => {});
+      await user.fetch(`https://do/refund?uid=${uid}`, { method: "POST" }).catch(() => {});
       return withCookie(
         json({ ok: false, error: "board is rebalancing — try again in a few seconds" }, 503),
         setCookie);
@@ -343,8 +416,8 @@ export async function handlePlace(request, env) {
   // GET /place/me — cooldown state for the current identity
   if (path === "/place/me") {
     const { uid, setCookie } = identity(request);
-    const user = env.USER.get(env.USER.idFromName(uid));
-    const me = await (await user.fetch("https://do/me")).json();
+    const user = env.USER.get(env.USER.idFromName(shardFor(uid)));
+    const me = await (await user.fetch(`https://do/me?uid=${uid}`)).json();
     return withCookie(json({ ...me, uid: uid.slice(0, 8) }), setCookie);
   }
 

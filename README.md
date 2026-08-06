@@ -28,9 +28,14 @@ READ (frames on the CDN, zero sockets)
 - The 512×512 board is **4 Tile objects** of 256×256 — sharding by
   construction: a pixel war in one corner cannot slow the rest, and a bigger
   board is just more tiles.
-- The **cooldown is a User object per identity** — a single-threaded
-  check-and-set that cannot be raced. It doesn't care whether its owner is a
-  human or an agent; OAuth slots into the same addressing later.
+- The **cooldown lives in 64 hash-addressed shard objects**, not an object per
+  person: a dedicated object per user is the wrong granularity for 16 bytes of
+  state (unbatchable durable writes, object-population = user-population).
+  Atomicity is unchanged — a shard is single-threaded and keeps an in-flight
+  overlay, so two requests from one identity in the same batching window can't
+  both pass; accepted cooldowns flush as one upsert per window, rejects don't
+  write at all. Per-user objects return later, opt-in, for features that earn
+  them (standing orders, agents).
 - Identity is a random 128-bit cookie for now.
 - `/place/history/:tx/:ty` streams the append-only log (the timelapse feed);
   inspect mode on the page shows who owns any pixel and since when.
