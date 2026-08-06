@@ -395,8 +395,9 @@ const HTML = `<!doctype html>
   cx.lineCap = cx.lineJoin = "round";
 
   var color = "#e8e8f0";
-  var me = (localStorage.canvasName ||
-    (localStorage.canvasName = "guest-" + Math.random().toString(36).slice(2, 6)));
+  // sessionStorage: per-tab identity, so a second window is a second peer
+  var me = (sessionStorage.canvasName ||
+    (sessionStorage.canvasName = "guest-" + Math.random().toString(36).slice(2, 6)));
   document.getElementById("who").textContent = "you are " + me;
   var toast = document.getElementById("toast");
 
