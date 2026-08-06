@@ -1,0 +1,11 @@
+{
+  // Standard Wrangler project — runs unchanged on `wrangler dev` (local),
+  // Cloudflare, or self-hosted via `celld deploy . --bucket s3://...`.
+  "name": "canvas",
+  "main": "index.js",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [{ "name": "CANVAS", "class_name": "Canvas" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Canvas"] }]
+}

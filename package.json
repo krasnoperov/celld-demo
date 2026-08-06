@@ -1,0 +1,9 @@
+{
+  "name": "celld-demo",
+  "private": true,
+  "description": "Shared canvas meta-demo: one Durable Object per room on celld, introspecting itself",
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}
