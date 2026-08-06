@@ -263,6 +263,14 @@ export class User {
       await this.state.storage.put("placed", placed);
       return json({ ok: true, next: now + COOLDOWN_MS, placed });
     }
+    // Refund: the cooldown was consumed but the pixel never landed (e.g. the
+    // tile's owner was mid-failover). Give the minute back.
+    if (url.pathname === "/refund" && request.method === "POST") {
+      await this.state.storage.put("nextAt", 0);
+      const placed = (await this.state.storage.get("placed")) ?? 0;
+      await this.state.storage.put("placed", Math.max(0, placed - 1));
+      return json({ ok: true });
+    }
     if (url.pathname === "/me") {
       return json({
         next: (await this.state.storage.get("nextAt")) ?? 0,
@@ -313,12 +321,23 @@ export async function handlePlace(request, env) {
     }
     const tx = Math.floor(x / TILE), ty = Math.floor(y / TILE);
     const tile = env.TILE.get(env.TILE.idFromName(`t:${tx},${ty}`));
-    const placed = await (await tile.fetch("https://do/px", {
-      method: "POST",
-      body: JSON.stringify({ x: x % TILE, y: y % TILE, c, uid }),
-    })).json();
-    return withCookie(
-      json({ ...placed, next: verdict.next, placed: verdict.placed }), setCookie);
+    try {
+      const resp = await tile.fetch("https://do/px", {
+        method: "POST",
+        body: JSON.stringify({ x: x % TILE, y: y % TILE, c, uid }),
+      });
+      if (!resp.ok && resp.status !== 429) throw new Error(`tile ${resp.status}`);
+      const placed = await resp.json();
+      return withCookie(
+        json({ ...placed, next: verdict.next, placed: verdict.placed }), setCookie);
+    } catch {
+      // Tile unreachable (node failover, ~seconds). The cooldown was already
+      // consumed — hand the minute back before reporting the outage.
+      await user.fetch("https://do/refund", { method: "POST" }).catch(() => {});
+      return withCookie(
+        json({ ok: false, error: "board is rebalancing — try again in a few seconds" }, 503),
+        setCookie);
+    }
   }
 
   // GET /place/me — cooldown state for the current identity
@@ -440,10 +459,20 @@ const PLACE_HTML = `<!doctype html>
     background: #121217; border: 1px solid var(--line); border-radius: 10px;
     touch-action: none; cursor: crosshair;
   }
+  #viewport.grabbing { cursor: grabbing; }
   #board {
     position: absolute; left: 0; top: 0; width: 512px; height: 512px;
     image-rendering: pixelated; transform-origin: 0 0;
   }
+  #cursorbox {
+    position: absolute; pointer-events: none; display: none;
+    border: 1px solid #fff; box-shadow: 0 0 0 1px #000, inset 0 0 0 1px #00000055;
+    border-radius: 1px;
+  }
+  #cursorbox.cool { border-style: dashed; background: transparent !important; }
+  #cursorbox.pop { animation: pop .25s ease-out; }
+  @keyframes pop { 0% { transform: scale(1.8); } 100% { transform: scale(1); } }
+  @media (prefers-reduced-motion: reduce) { #cursorbox.pop { animation: none; } }
   .bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
   .pal {
     width: 22px; height: 22px; border: 1px solid #00000088; cursor: pointer; padding: 0;
@@ -501,16 +530,20 @@ const PLACE_HTML = `<!doctype html>
 </header>
 <main>
   <div class="left">
-    <div id="viewport"><canvas id="board" width="512" height="512"></canvas></div>
+    <div id="viewport">
+      <canvas id="board" width="512" height="512"></canvas>
+      <div id="cursorbox"></div>
+    </div>
     <div class="bar" id="palette"></div>
     <div class="bar">
-      <button class="txt" id="zin">zoom +</button>
-      <button class="txt" id="zout">zoom &minus;</button>
-      <button class="txt" id="inspect">inspect</button>
+      <button class="txt" id="zout" title="zoom out (-)">&minus;</button>
+      <button class="txt" id="zfit" title="fit board (0)">fit</button>
+      <button class="txt" id="zin" title="zoom in (+)">+</button>
+      <button class="txt" id="inspect" title="who placed this pixel? (i)">inspect</button>
       <span class="note" id="coords">&mdash;</span>
       <div id="cool"><div id="coolbar"></div><span id="cooltext">&mdash;</span></div>
     </div>
-    <div id="toast">pick a color, click a pixel</div>
+    <div id="toast">pick a color, click a pixel &middot; wheel or pinch to zoom, drag to pan</div>
   </div>
   <aside>
     <div class="card">
@@ -584,6 +617,7 @@ const PLACE_HTML = `<!doctype html>
       color = i;
       pal.querySelectorAll(".pal").forEach(function (x) { x.classList.remove("on"); });
       b.classList.add("on");
+      if (typeof drawCursor === "function") drawCursor();
     };
     pal.appendChild(b);
   });
@@ -609,68 +643,167 @@ const PLACE_HTML = `<!doctype html>
   }
 
   // --- zoom & pan ----------------------------------------------------------
-  function fitScale() { return vp.clientWidth / BOARD; }
+  // Crisp rendering: when zoomed in, the effective scale is snapped so every
+  // board pixel maps to a whole number of DEVICE pixels (no shimmering, no
+  // uneven pixel widths on any DPI). At fit level the whole board is shown.
+  var dpr = window.devicePixelRatio || 1;
+  var cbox = el("cursorbox");
+  var hover = null;               // [x, y] under the cursor, board coords
+  function fitScale() { return Math.min(vp.clientWidth, vp.clientHeight) / BOARD; }
+  function eff() {
+    var raw = fitScale() * scale;
+    if (scale === 1) return raw;                       // overview: exact fit
+    return Math.max(1 / dpr, Math.round(raw * dpr) / dpr);
+  }
   function apply() {
-    var f = fitScale() * scale;
-    ox = Math.min(0, Math.max(vp.clientWidth - BOARD * f, ox));
-    oy = Math.min(0, Math.max(Math.min(0, vp.clientHeight - BOARD * f), oy));
+    dpr = window.devicePixelRatio || 1;   // tracks browser zoom changes
+    var f = eff(), bw = BOARD * f;
+    var W = vp.clientWidth, H = vp.clientHeight;
+    ox = bw <= W ? (W - bw) / 2 : Math.min(0, Math.max(W - bw, ox));
+    oy = bw <= H ? (H - bw) / 2 : Math.min(0, Math.max(H - bw, oy));
+    ox = Math.round(ox * dpr) / dpr;                   // snap: no blurry seams
+    oy = Math.round(oy * dpr) / dpr;
     cv.style.transform = "translate(" + ox + "px," + oy + "px) scale(" + f + ")";
+    drawCursor();
   }
   function zoomAt(cxp, cyp, factor) {
-    var f0 = fitScale() * scale;
-    scale = Math.min(16, Math.max(1, scale * factor));
-    var f1 = fitScale() * scale;
+    var f0 = eff();
+    scale = Math.min(32, Math.max(1, scale * factor));
+    var f1 = eff();
     ox = cxp - (cxp - ox) * (f1 / f0);
     oy = cyp - (cyp - oy) * (f1 / f0);
     apply();
   }
-  el("zin").onclick = function () { zoomAt(vp.clientWidth / 2, vp.clientHeight / 2, 2); };
-  el("zout").onclick = function () { zoomAt(vp.clientWidth / 2, vp.clientHeight / 2, 0.5); };
+  function center() { scale = 1; apply(); }
+  function zoomButton(factor) {
+    return function () { zoomAt(vp.clientWidth / 2, vp.clientHeight / 2, factor); };
+  }
+  el("zin").onclick = zoomButton(2);
+  el("zout").onclick = zoomButton(0.5);
+  el("zfit").onclick = center;
   vp.addEventListener("wheel", function (ev) {
     ev.preventDefault();
     var r = vp.getBoundingClientRect();
     zoomAt(ev.clientX - r.left, ev.clientY - r.top, ev.deltaY < 0 ? 1.25 : 0.8);
   }, { passive: false });
-
-  function boardPos(ev) {
+  vp.addEventListener("dblclick", function (ev) {
     var r = vp.getBoundingClientRect();
-    var f = fitScale() * scale;
-    return [
-      Math.floor((ev.clientX - r.left - ox) / f),
-      Math.floor((ev.clientY - r.top - oy) / f),
-    ];
+    zoomAt(ev.clientX - r.left, ev.clientY - r.top, 2);
+  });
+
+  // The cursor box previews exactly which pixel a click will paint, in the
+  // selected color; dashed while the cooldown is running.
+  function drawCursor() {
+    var f = eff();
+    if (!hover || f < 4) { cbox.style.display = "none"; return; }
+    cbox.style.display = "block";
+    cbox.style.width = cbox.style.height = f + "px";
+    cbox.style.left = (ox + hover[0] * f) + "px";
+    cbox.style.top = (oy + hover[1] * f) + "px";
+    cbox.style.background = inspectMode ? "transparent" : PALETTE[color] + "b0";
+    cbox.classList.toggle("cool", !inspectMode && Date.now() < nextAt);
   }
 
-  var drag = null;
+  function boardPos(x, y) {
+    var r = vp.getBoundingClientRect();
+    var f = eff();
+    return [Math.floor((x - r.left - ox) / f), Math.floor((y - r.top - oy) / f)];
+  }
+  function inBoard(p) { return p[0] >= 0 && p[0] < BOARD && p[1] >= 0 && p[1] < BOARD; }
+
+  // Pointers: one finger/button drags (or clicks), two fingers pinch-zoom.
+  var pointers = {}, drag = null, pinch = null;
+  function pointerCount() { return Object.keys(pointers).length; }
+  function pinchInfo() {
+    var ids = Object.keys(pointers);
+    var a = pointers[ids[0]], b = pointers[ids[1]];
+    var r = vp.getBoundingClientRect();
+    return {
+      d: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+      mx: (a.x + b.x) / 2 - r.left,
+      my: (a.y + b.y) / 2 - r.top,
+    };
+  }
   vp.addEventListener("pointerdown", function (ev) {
     vp.setPointerCapture(ev.pointerId);
-    drag = { x: ev.clientX, y: ev.clientY, ox: ox, oy: oy, moved: false };
+    pointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
+    if (pointerCount() === 2) {
+      var pi = pinchInfo();
+      pinch = { d: pi.d, scale: scale };
+      drag = null;
+    } else {
+      drag = { x: ev.clientX, y: ev.clientY, ox: ox, oy: oy, moved: false };
+    }
   });
   vp.addEventListener("pointermove", function (ev) {
-    var p = boardPos(ev);
-    el("coords").textContent =
-      (p[0] >= 0 && p[0] < BOARD && p[1] >= 0 && p[1] < BOARD)
-        ? "(" + p[0] + ", " + p[1] + ") " + scale + "x" : "";
-    if (!drag) return;
-    var dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
-    if (Math.abs(dx) + Math.abs(dy) > 5) drag.moved = true;
-    if (drag.moved) { ox = drag.ox + dx; oy = drag.oy + dy; apply(); }
+    if (pointers[ev.pointerId]) {
+      pointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
+    }
+    if (pinch && pointerCount() === 2) {
+      var pi = pinchInfo();
+      var f0 = eff();
+      scale = Math.min(32, Math.max(1, pinch.scale * (pi.d / pinch.d)));
+      var f1 = eff();
+      ox = pi.mx - (pi.mx - ox) * (f1 / f0);
+      oy = pi.my - (pi.my - oy) * (f1 / f0);
+      apply();
+      return;
+    }
+    var p = boardPos(ev.clientX, ev.clientY);
+    hover = inBoard(p) ? p : null;
+    el("coords").textContent = hover
+      ? "(" + p[0] + ", " + p[1] + ") \\u00b7 " + (Math.round(eff() * 10) / 10) + "\\u00d7" : "";
+    if (drag) {
+      var dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+      if (Math.abs(dx) + Math.abs(dy) > 5) drag.moved = true;
+      if (drag.moved) {
+        vp.classList.add("grabbing");
+        ox = drag.ox + dx; oy = drag.oy + dy;
+        apply();
+        return;
+      }
+    }
+    drawCursor();
   });
-  vp.addEventListener("pointerup", function (ev) {
-    var wasClick = drag && !drag.moved;
+  function pointerEnd(ev) {
+    delete pointers[ev.pointerId];
+    if (pointerCount() < 2) pinch = null;
+    vp.classList.remove("grabbing");
+    var wasClick = drag && !drag.moved && ev.type === "pointerup";
     drag = null;
     if (!wasClick) return;
-    var p = boardPos(ev);
-    if (p[0] < 0 || p[0] >= BOARD || p[1] < 0 || p[1] >= BOARD) return;
+    var p = boardPos(ev.clientX, ev.clientY);
+    if (!inBoard(p)) return;
     if (inspectMode) { who(p[0], p[1]); return; }
     place(p[0], p[1]);
-  });
+  }
+  vp.addEventListener("pointerup", pointerEnd);
+  vp.addEventListener("pointercancel", pointerEnd);
+  vp.addEventListener("pointerleave", function () { hover = null; drawCursor(); });
 
-  el("inspect").onclick = function () {
-    inspectMode = !inspectMode;
+  function setInspect(on) {
+    inspectMode = on;
     el("inspect").classList.toggle("on", inspectMode);
     note(inspectMode ? "inspect: click any pixel to see who placed it" : "pick a color, click a pixel");
-  };
+    drawCursor();
+  }
+  el("inspect").onclick = function () { setInspect(!inspectMode); };
+
+  // Keyboard: +/- zoom, 0 fit, i inspect, arrows pan.
+  window.addEventListener("keydown", function (ev) {
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    var pan = 64;
+    if (ev.key === "+" || ev.key === "=") zoomButton(2)();
+    else if (ev.key === "-") zoomButton(0.5)();
+    else if (ev.key === "0") center();
+    else if (ev.key === "i") setInspect(!inspectMode);
+    else if (ev.key === "ArrowLeft") { ox += pan; apply(); }
+    else if (ev.key === "ArrowRight") { ox -= pan; apply(); }
+    else if (ev.key === "ArrowUp") { oy += pan; apply(); }
+    else if (ev.key === "ArrowDown") { oy -= pan; apply(); }
+    else return;
+    ev.preventDefault();
+  });
 
   // --- placing -------------------------------------------------------------
   function place(x, y) {
@@ -687,6 +820,9 @@ const PLACE_HTML = `<!doctype html>
         px(x, y, color);
         nextAt = r.next;
         el("m-placed").textContent = r.placed;
+        cbox.classList.remove("pop");
+        void cbox.offsetWidth;               // restart the animation
+        cbox.classList.add("pop");
         note("placed <b>(" + x + ", " + y + ")</b> \\u2014 row " + r.seq + " in tile t:" +
           Math.floor(x / TILE) + "," + Math.floor(y / TILE));
       } else if (r.cooldown) {
@@ -725,6 +861,7 @@ const PLACE_HTML = `<!doctype html>
       el("cooltext").textContent = Math.ceil(left / 1000) + "s";
       el("m-next").textContent = Math.ceil(left / 1000) + "s";
     }
+    if (typeof drawCursor === "function") drawCursor();
   }, 250);
 
   // --- me ------------------------------------------------------------------
