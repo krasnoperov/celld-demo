@@ -317,7 +317,7 @@ const HTML = `<!doctype html>
   #peerlist .r { color: var(--dim); margin-left: auto; }
   #peerlist .none { color: var(--dim); }
   #wire { height: 190px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
-  #wire div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #797985; }
+  #wire div { flex: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #797985; }
   #wire .in::before  { content: "\\2190 "; color: #6bb2f0; }
   #wire .out::before { content: "\\2192 "; color: #7fd07f; }
   #wire b { color: #bcbcc8; font-weight: 600; }
