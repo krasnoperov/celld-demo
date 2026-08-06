@@ -14,15 +14,15 @@ Write and read paths scale on different axes, so they are separate:
 
 ```
 WRITE (bounded by cooldown, batched)
-  POST /place/px -> Worker -> User DO (atomic cooldown) -> Tile DO
-  The tile buffers placements and flushes them as ONE multi-row insert every
-  ~50ms; callers are acked only after the flush is durable (RPO = 0).
+  POST /place/px -> Worker -> cooldown shard (atomic check) -> Tile DO
+  Both objects buffer their writes and flush each ~50ms window as ONE durable
+  unit; callers are acked only after the flush is durable (RPO = 0).
 
 READ (frames on the CDN, zero sockets)
   Tile DOs cut frames on durable alarms: a diff frame ~1/s when dirty, a full
   frame every 30 diffs. Frames are immutable blobs behind long-lived cache
   headers; a 1-second manifest points at them. Viewers poll the Cloudflare
-  cache — the origin renders frames at a fixed rate and never sees them.
+  cache — origin work is O(1) per tile per second, whatever the audience.
 ```
 
 - The 512×512 board is **4 Tile objects** of 256×256 — sharding by
@@ -36,15 +36,17 @@ READ (frames on the CDN, zero sockets)
   both pass; accepted cooldowns flush as one upsert per window, rejects don't
   write at all. Per-user objects return later, opt-in, for features that earn
   them (standing orders, agents).
-- Identity is a random 128-bit cookie for now.
-- `/place/history/:tx/:ty` streams the append-only log (the timelapse feed);
-  inspect mode on the page shows who owns any pixel and since when.
+- Identity is a random 128-bit cookie; it doubles as the bearer token, so
+  public endpoints only ever emit an 8-hex prefix of it.
+- `/place/history/:tx/:ty?since=` pages through the append-only log (the
+  timelapse feed); inspect mode shows who owns any pixel and since when.
 
 There are deliberately **no formal scalability defects** left in the serving
-path: viewer cost at the origin is O(1) per tile (manifest + frame renders),
-write throughput is one durable flush per tile per 50ms regardless of batch
-size, and per-user state is sharded across User objects. The remaining levers
-(more tiles, more nodes on the same bucket) are configuration, not redesign.
+path: origin work for viewers is O(1) per tile per second (cache misses
+aside), write throughput is one durable flush per object per 50ms window
+regardless of batch size, and cooldown state lives in a fixed set of shards.
+The remaining levers (more tiles, more nodes on the same bucket) are
+configuration, not redesign.
 
 Frame/manifest URLs end in `.bin` deliberately: BIN is on Cloudflare's
 default-cacheable extension list, so the CDN caches them with zero zone
@@ -82,6 +84,6 @@ on `wrangler dev` or Cloudflare.
 
 - The server never executes anything a client sends: every field of every
   request is validated, clamped, and length-capped server-side.
-- Cooldown per identity, a flood floor per tile, strict CSP on the page.
+- Cooldown per identity, a per-tile placement ceiling, strict CSP on the page.
 - The node binds to localhost; expose it through a reverse proxy (Caddy/nginx)
   that terminates TLS.

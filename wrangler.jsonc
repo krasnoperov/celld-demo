@@ -10,6 +10,8 @@
       { "name": "USER", "class_name": "User" }
     ]
   },
+  // v1 created a Canvas class that has since been removed; celld doesn't
+  // support deleted_sqlite_classes yet, so the tag stays as history.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Canvas"] },
     { "tag": "v2", "new_sqlite_classes": ["Tile", "User"] }

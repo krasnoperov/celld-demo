@@ -4,9 +4,9 @@
 // Architecture (the "correct" tier from the design doc, on by default):
 //
 //   WRITE PATH — bounded by cooldown, batched:
-//     POST /place/px -> Worker -> User DO (atomic cooldown) -> Tile DO.
-//     The tile buffers placements and flushes them as ONE multi-row insert
-//     every ~50ms; callers are acked only after the flush is durable.
+//     POST /place/px -> Worker -> User shard (atomic cooldown) -> Tile.
+//     Both objects buffer their writes and flush each ~50ms window as ONE
+//     durable unit; callers are acked only after the flush is durable.
 //     This removes the per-write flush ceiling without weakening RPO=0.
 //
 //   READ PATH — frames on the CDN, zero sockets:
@@ -16,12 +16,15 @@
 //     (edge TTL 1s) points at them. A million viewers poll the Cloudflare
 //     cache; the origin renders frames at a fixed rate and never sees them.
 //
-// One User object per identity owns the cooldown. It doesn't care whether
-// its owner is a human, an agent, or a future OAuth login.
+// The cooldown lives in a fixed set of shard objects (see the User section);
+// it doesn't care whether its owner is a human, an agent, or an OAuth login.
+//
+// uid doubles as the bearer token, so it must never leave the server intact:
+// every public surface emits at most an 8-hex prefix of it.
 
-export const TILE = 256;          // pixels per tile side
-export const TILES = 2;           // board is TILES x TILES tiles
-export const BOARD = TILE * TILES;
+const TILE = 256;                 // pixels per tile side
+const TILES = 2;                  // board is TILES x TILES tiles
+const BOARD = TILE * TILES;
 const COOLDOWN_MS = 60_000;
 const PALETTE = [
   "#ffffff", "#e4e4e4", "#888888", "#222222",
@@ -29,11 +32,10 @@ const PALETTE = [
   "#e5d900", "#94e044", "#02be01", "#00d3dd",
   "#0083c7", "#0000ea", "#cf6ee4", "#820080",
 ];
-const TILE_RATE = 30;             // placements/s per tile (flood floor)
+const TILE_RATE = 30;             // per-tile placement ceiling, per second
 const FLUSH_MS = 50;              // write batching window
 const FRAME_MS = 1000;            // min interval between diff frames
 const FULL_EVERY = 30;            // cut a full frame every N diffs
-const KEEP_DIFFS = 90;            // serving window; older viewers refetch full
 
 // Frame wire format (little-endian):
 //   full frame: 32768 bytes, one nibble per pixel, row-major
@@ -44,7 +46,6 @@ const KEEP_DIFFS = 90;            // serving window; older viewers refetch full
 export class Tile {
   constructor(state, env) {
     this.state = state;
-    this.bornAt = Date.now();
     this.activations = null;
     this.rate = { ts: 0, n: 0 };
     this.pending = [];            // buffered placements awaiting the next flush
@@ -71,9 +72,9 @@ export class Tile {
         .exec("SELECT seq, x, y, c FROM pixels WHERE seq > ? ORDER BY seq", this.seq)
         .toArray();
       for (const p of tail) { this.setNibble(p.x, p.y, p.c); this.seq = p.seq; }
-      // frames: { list: [{seq, from, kind}], fullSeq, lastFrameAt }
+      // frames: { list: [{seq, from}], fullSeq, prevFullSeq }
       this.frames = (await this.state.storage.get("frames"))
-        ?? { list: [], fullSeq: -1, lastFrameAt: 0 };
+        ?? { list: [], fullSeq: -1, prevFullSeq: null };
       if (this.frames.fullSeq === -1) await this.cutFullFrame();  // genesis frame
     })());
   }
@@ -93,10 +94,13 @@ export class Tile {
   // whichever wakes first flushes the whole buffer, the rest find their row
   // already assigned. One durable unit per window either way.
   async place(x, y, c, uid) {
-    const entry = { x, y, c, uid, ts: Date.now(), seq: null };
+    const entry = { x, y, c, uid, ts: Date.now(), seq: null, err: null };
     this.pending.push(entry);
     await new Promise((r) => setTimeout(r, FLUSH_MS));
-    if (entry.seq === null) await this.flush();
+    if (entry.seq === null && !entry.err) {
+      await this.flush().catch(() => {});   // failure lands on entry.err below
+    }
+    if (entry.err || entry.seq === null) throw entry.err ?? new Error("flush incomplete");
     return entry.seq;
   }
 
@@ -104,25 +108,31 @@ export class Tile {
     const batch = this.pending;
     this.pending = [];
     if (batch.length === 0) return;
+    try {
+      // One durable unit for the whole batch: a single multi-row INSERT.
+      const values = batch.map(() => "(?, ?, ?, ?, ?)").join(", ");
+      const args = batch.flatMap((p) => [p.x, p.y, p.c, p.uid, p.ts]);
+      const rows = this.state.storage.sql.exec(
+        `INSERT INTO pixels (x, y, c, uid, ts) VALUES ${values} RETURNING seq`,
+        ...args,
+      ).toArray();
+      batch.forEach((p, i) => {
+        this.setNibble(p.x, p.y, p.c);
+        p.seq = rows[i].seq;
+      });
+      this.seq = rows[rows.length - 1].seq;
+      await this.state.storage.put("bitmap", { seq: this.seq, bytes: this.bitmap.buffer.slice(0) });
 
-    // One durable unit for the whole batch: a single multi-row INSERT.
-    const values = batch.map(() => "(?, ?, ?, ?, ?)").join(", ");
-    const args = batch.flatMap((p) => [p.x, p.y, p.c, p.uid, p.ts]);
-    const rows = this.state.storage.sql.exec(
-      `INSERT INTO pixels (x, y, c, uid, ts) VALUES ${values} RETURNING seq`,
-      ...args,
-    ).toArray();
-    batch.forEach((p, i) => {
-      this.setNibble(p.x, p.y, p.c);
-      p.seq = rows[i].seq;
-    });
-    this.seq = rows[rows.length - 1].seq;
-    await this.state.storage.put("bitmap", { seq: this.seq, bytes: this.bitmap.buffer.slice(0) });
-
-    // Arm the frame alarm unless one is already pending. The alarm is durable:
-    // it survives hibernation, so the last pixels always make it into a frame.
-    if ((await this.state.storage.getAlarm()) === null) {
-      await this.state.storage.setAlarm(Date.now() + FRAME_MS);
+      // Arm the frame alarm unless one is already pending. The alarm is
+      // durable: it survives hibernation, so the last pixels always frame.
+      if ((await this.state.storage.getAlarm()) === null) {
+        await this.state.storage.setAlarm(Date.now() + FRAME_MS);
+      }
+    } catch (err) {
+      // The whole window fails together — no caller may ack a write that
+      // didn't reach durability.
+      for (const p of batch) p.err = err;
+      throw err;
     }
   }
 
@@ -149,38 +159,29 @@ export class Tile {
     const buf = new Uint32Array(rows.length);
     rows.forEach((p, i) => { buf[i] = (p.y * TILE + p.x) | (p.c << 16); });
     await this.state.storage.put(`f:${this.seq}`, buf.buffer);
-    this.frames.list.push({ seq: this.seq, from, kind: "diff" });
-    this.frames.lastFrameAt = Date.now();
+    this.frames.list.push({ seq: this.seq, from });
 
-    const diffsSinceFull = this.frames.list.filter((f) => f.seq > this.frames.fullSeq).length;
-    if (diffsSinceFull >= FULL_EVERY) await this.cutFullFrame();
-    await this.pruneFrames();
+    if (this.frames.list.length >= FULL_EVERY) await this.cutFullFrame();
     await this.state.storage.put("frames", this.frames);
   }
 
+  // A new full frame resets the serving window: the diffs it covers are
+  // pruned, and only one previous full is kept for viewers mid-chain (the
+  // CDN keeps serving older immutable frames from its cache regardless).
   async cutFullFrame() {
     await this.state.storage.put(`f:${this.seq}:full`, this.bitmap.buffer.slice(0));
-    this.frames.fullSeq = this.seq;
-    this.frames.lastFrameAt = Date.now();
+    for (const f of this.frames.list) await this.state.storage.delete(`f:${f.seq}`);
+    if (this.frames.prevFullSeq != null) {
+      await this.state.storage.delete(`f:${this.frames.prevFullSeq}:full`);
+    }
+    this.frames = { list: [], fullSeq: this.seq, prevFullSeq: this.frames.fullSeq };
     await this.state.storage.put("frames", this.frames);
   }
 
-  async pruneFrames() {
-    // Keep the serving window; a viewer older than it refetches the full frame.
-    while (this.frames.list.length > KEEP_DIFFS) {
-      const old = this.frames.list.shift();
-      await this.state.storage.delete(`f:${old.seq}`);
-    }
-  }
-
-  async meta() {
-    const row = this.state.storage.sql
-      .exec("SELECT COUNT(*) AS n FROM pixels").one();
+  meta() {
     return {
-      bornAt: this.bornAt, now: Date.now(), activations: this.activations,
-      pixels: row.n, seq: this.seq,
-      frame: this.lastFrameSeq(), full: this.frames.fullSeq,
-      frameAge: this.frames.lastFrameAt ? Date.now() - this.frames.lastFrameAt : null,
+      activations: this.activations,
+      placements: this.seq,   // total placements ever (overwrites included)
     };
   }
 
@@ -206,9 +207,9 @@ export class Tile {
         seq: this.lastFrameSeq(),
         full: this.frames.fullSeq,
         diffs: this.frames.list
-          .filter((f) => f.seq > this.frames.fullSeq || f.from >= this.frames.fullSeq)
+          .filter((f) => f.seq > this.frames.fullSeq)
           .map((f) => ({ seq: f.seq, from: f.from })),
-        meta: await this.meta(),
+        meta: this.meta(),
       });
     }
 
@@ -222,10 +223,11 @@ export class Tile {
       });
     }
 
+    // uid is the bearer token — public reads get an 8-hex prefix, never more.
     if (url.pathname === "/who") {
       const x = +url.searchParams.get("x"), y = +url.searchParams.get("y");
       const rows = this.state.storage.sql.exec(
-        "SELECT uid, ts, c FROM pixels WHERE x = ? AND y = ? ORDER BY seq DESC LIMIT 1",
+        "SELECT substr(uid, 1, 8) AS uid, ts FROM pixels WHERE x = ? AND y = ? ORDER BY seq DESC LIMIT 1",
         x, y,
       ).toArray();
       return json(rows[0] ?? null);
@@ -234,7 +236,7 @@ export class Tile {
     if (url.pathname === "/history") {
       const since = +(url.searchParams.get("since") ?? 0);
       const rows = this.state.storage.sql.exec(
-        "SELECT seq, x, y, c, uid, ts FROM pixels WHERE seq > ? ORDER BY seq LIMIT 10000",
+        "SELECT seq, x, y, c, substr(uid, 1, 8) AS uid, ts FROM pixels WHERE seq > ? ORDER BY seq LIMIT 10000",
         since,
       ).toArray();
       return json(rows);
@@ -257,9 +259,9 @@ export class Tile {
 //
 // The class keeps the name `User` so celld migrations stay untouched.
 
-export const USER_SHARDS = 64;
+const USER_SHARDS = 64;
 
-export function shardFor(uid) {
+function shardFor(uid) {
   let h = 0x811c9dc5;                       // FNV-1a over the uid hex
   for (let i = 0; i < uid.length; i++) {
     h ^= uid.charCodeAt(i);
@@ -288,6 +290,11 @@ export class User {
       .toArray()[0];
   }
 
+  // An awaited kv write: makes the whole window's SQL durable before any ack.
+  barrier() {
+    return this.state.storage.put("v", Date.now());
+  }
+
   // Accept/reject is decided synchronously against SQL + the in-flight
   // overlay, so two requests for the same uid in one batching window cannot
   // both pass. Accepted entries flush as ONE upsert per window (same
@@ -295,13 +302,16 @@ export class User {
   async tryPlace(uid) {
     const now = Date.now();
     const eff = this.pendingNext.get(uid) ?? this.row(uid)?.nextAt ?? 0;
-    if (now < eff) return { ok: false, next: eff };      // reject: zero writes
+    if (now < eff) return { ok: false, cooldown: true, next: eff };  // reject: zero writes
     const next = now + COOLDOWN_MS;
     this.pendingNext.set(uid, next);
-    const entry = { uid, next, done: false };
+    const entry = { uid, next, done: false, err: null };
     this.pending.push(entry);
     await new Promise((r) => setTimeout(r, FLUSH_MS));
-    if (!entry.done) await this.flush();
+    if (!entry.done && !entry.err) await this.flush().catch(() => {});
+    if (entry.err || !entry.done) {
+      return { ok: false, error: "cooldown store unavailable" };
+    }
     const placed = this.row(uid)?.placed ?? 1;
     return { ok: true, next, placed };
   }
@@ -310,19 +320,28 @@ export class User {
     const batch = this.pending;
     this.pending = [];
     if (batch.length === 0) return;
-    const values = batch.map(() => "(?, ?, 1)").join(", ");
-    const args = batch.flatMap((p) => [p.uid, p.next]);
-    this.state.storage.sql.exec(
-      `INSERT INTO users (uid, nextAt, placed) VALUES ${values}
-       ON CONFLICT(uid) DO UPDATE SET
-         nextAt = excluded.nextAt, placed = users.placed + 1`,
-      ...args,
-    );
-    // One durable barrier for the whole window.
-    await this.state.storage.put("seq", ((await this.state.storage.get("seq")) ?? 0) + 1);
-    for (const p of batch) {
-      p.done = true;
-      if (this.pendingNext.get(p.uid) === p.next) this.pendingNext.delete(p.uid);
+    try {
+      const values = batch.map(() => "(?, ?, 1)").join(", ");
+      const args = batch.flatMap((p) => [p.uid, p.next]);
+      this.state.storage.sql.exec(
+        `INSERT INTO users (uid, nextAt, placed) VALUES ${values}
+         ON CONFLICT(uid) DO UPDATE SET
+           nextAt = excluded.nextAt, placed = users.placed + 1`,
+        ...args,
+      );
+      await this.barrier();
+      for (const p of batch) {
+        p.done = true;
+        if (this.pendingNext.get(p.uid) === p.next) this.pendingNext.delete(p.uid);
+      }
+    } catch (err) {
+      // Fail the whole window together and roll the overlay back so the
+      // affected users aren't stuck behind a cooldown that never persisted.
+      for (const p of batch) {
+        p.err = err;
+        if (this.pendingNext.get(p.uid) === p.next) this.pendingNext.delete(p.uid);
+      }
+      throw err;
     }
   }
 
@@ -335,12 +354,16 @@ export class User {
       return json(await this.tryPlace(uid));
     }
     // Refund: the cooldown was consumed but the pixel never landed (e.g. the
-    // tile's owner was mid-failover). Give the minute back. Rare -> unbatched.
+    // tile's owner was mid-failover). Give the minute back. Conditional on the
+    // exact nextAt that was armed, so a stale refund can't clear a newer
+    // cooldown. Rare -> unbatched.
     if (url.pathname === "/refund" && request.method === "POST") {
-      this.pendingNext.delete(uid);
+      const next = +(url.searchParams.get("next") ?? 0);
+      if (this.pendingNext.get(uid) === next) this.pendingNext.delete(uid);
       this.state.storage.sql.exec(
-        "UPDATE users SET nextAt = 0, placed = MAX(0, placed - 1) WHERE uid = ?", uid);
-      await this.state.storage.put("seq", ((await this.state.storage.get("seq")) ?? 0) + 1);
+        "UPDATE users SET nextAt = 0, placed = MAX(0, placed - 1) WHERE uid = ? AND nextAt = ?",
+        uid, next);
+      await this.barrier();
       return json({ ok: true });
     }
     if (url.pathname === "/me") {
@@ -381,36 +404,44 @@ export async function handlePlace(request, env) {
   // POST /place/px {x, y, c} — the write path
   if (path === "/place/px" && request.method === "POST") {
     const { uid, setCookie } = identity(request);
+    if (+(request.headers.get("content-length") ?? 0) > 1024) {
+      return json({ ok: false }, 413);
+    }
     let body;
     try { body = await request.json(); } catch { return json({ ok: false }, 400); }
-    const x = body.x | 0, y = body.y | 0, c = body.c | 0;
-    if (x < 0 || x >= BOARD || y < 0 || y >= BOARD || c < 0 || c >= PALETTE.length) {
+    const { x, y, c } = body ?? {};
+    if (!Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(c) ||
+        x < 0 || x >= BOARD || y < 0 || y >= BOARD || c < 0 || c >= PALETTE.length) {
       return json({ ok: false, error: "out of range" }, 400);
     }
     const user = env.USER.get(env.USER.idFromName(shardFor(uid)));
     const verdict = await (await user.fetch(`https://do/try?uid=${uid}`, { method: "POST" })).json();
     if (!verdict.ok) {
-      return withCookie(json({ ok: false, cooldown: true, next: verdict.next }, 429), setCookie);
+      return withCookie(json(verdict, verdict.cooldown ? 429 : 503), setCookie);
     }
     const tx = Math.floor(x / TILE), ty = Math.floor(y / TILE);
     const tile = env.TILE.get(env.TILE.idFromName(`t:${tx},${ty}`));
+    let tileResult = null;
     try {
       const resp = await tile.fetch("https://do/px", {
         method: "POST",
         body: JSON.stringify({ x: x % TILE, y: y % TILE, c, uid }),
       });
-      if (!resp.ok && resp.status !== 429) throw new Error(`tile ${resp.status}`);
-      const placed = await resp.json();
+      tileResult = await resp.json();
+    } catch {}
+    if (!tileResult?.ok) {
+      // The pixel never landed — the tile is mid-failover, shed the write
+      // under flood, or failed its flush. The cooldown was already consumed:
+      // hand the minute back (conditional on the exact nextAt we armed).
+      await user.fetch(`https://do/refund?uid=${uid}&next=${verdict.next}`, { method: "POST" })
+        .catch(() => {});
       return withCookie(
-        json({ ...placed, next: verdict.next, placed: verdict.placed }), setCookie);
-    } catch {
-      // Tile unreachable (node failover, ~seconds). The cooldown was already
-      // consumed — hand the minute back before reporting the outage.
-      await user.fetch(`https://do/refund?uid=${uid}`, { method: "POST" }).catch(() => {});
-      return withCookie(
-        json({ ok: false, error: "board is rebalancing — try again in a few seconds" }, 503),
+        json({ ok: false, error: tileResult?.error ?? "board is rebalancing — try again in a few seconds" },
+          tileResult ? 429 : 503),
         setCookie);
     }
+    return withCookie(
+      json({ ...tileResult, next: verdict.next, placed: verdict.placed }), setCookie);
   }
 
   // GET /place/me — cooldown state for the current identity
@@ -425,38 +456,48 @@ export async function handlePlace(request, env) {
   let m = path.match(/^\/place\/manifest\/(\d)\/(\d)\.bin$/);
   if (m && +m[1] < TILES && +m[2] < TILES) {
     const tile = env.TILE.get(env.TILE.idFromName(`t:${m[1]},${m[2]}`));
-    const manifest = await (await tile.fetch("https://do/manifest")).text();
-    return new Response(manifest, {
-      headers: {
-        "content-type": "application/json",
-        "cache-control": "public, max-age=0, s-maxage=1, stale-while-revalidate=5",
-      },
-    });
+    try {
+      const resp = await tile.fetch("https://do/manifest");
+      if (!resp.ok) throw new Error("tile error");    // never cache-wrap an error as 200
+      return new Response(await resp.text(), {
+        headers: {
+          "content-type": "application/json",
+          "cache-control": "public, max-age=0, s-maxage=1, stale-while-revalidate=5",
+        },
+      });
+    } catch {
+      return json({ error: "rebalancing" }, 503);   // don't leak runtime errors
+    }
   }
 
   // GET /place/frame/:tx/:ty/:seq[.full].bin — immutable, cached ~forever
   m = path.match(/^\/place\/frame\/(\d)\/(\d)\/(\d+)(\.full)?\.bin$/);
   if (m && +m[1] < TILES && +m[2] < TILES) {
     const tile = env.TILE.get(env.TILE.idFromName(`t:${m[1]},${m[2]}`));
-    const resp = await tile.fetch(`https://do/frame/${m[3]}${m[4] ? ":full" : ""}`);
-    if (!resp.ok) return resp;
-    return new Response(resp.body, {
-      headers: {
-        "content-type": "application/octet-stream",
-        "cache-control": "public, max-age=31536000, immutable",
-      },
-    });
+    try {
+      const resp = await tile.fetch(`https://do/frame/${m[3]}${m[4] ? ":full" : ""}`);
+      if (!resp.ok) return new Response("frame expired", { status: 404 });
+      return new Response(resp.body, {
+        headers: {
+          "content-type": "application/octet-stream",
+          "cache-control": "public, max-age=31536000, immutable",
+        },
+      });
+    } catch {
+      return new Response("rebalancing", { status: 503 });
+    }
   }
 
   // GET /place/who?x=&y= — provenance of one pixel
   if (path === "/place/who") {
     const x = +url.searchParams.get("x"), y = +url.searchParams.get("y");
-    if (!(x >= 0 && x < BOARD && y >= 0 && y < BOARD)) return json(null, 400);
+    if (!Number.isInteger(x) || !Number.isInteger(y) ||
+        x < 0 || x >= BOARD || y < 0 || y >= BOARD) return json(null, 400);
     const tile = env.TILE.get(env.TILE.idFromName(
       `t:${Math.floor(x / TILE)},${Math.floor(y / TILE)}`));
     const who = await (await tile.fetch(
       `https://do/who?x=${x % TILE}&y=${y % TILE}`)).json();
-    return json(who && { uid: who.uid.slice(0, 8), ts: who.ts, c: who.c });
+    return json(who && { uid: who.uid, ts: who.ts });
   }
 
   // GET /place/history/:tx/:ty?since= — the forward-only log (timelapse feed)
@@ -658,7 +699,7 @@ const PLACE_HTML = `<!doctype html>
 </footer>
 <script>
 (function () {
-  var TILE = 256, TILES = 2, BOARD = 512;
+  var TILE = ${TILE}, TILES = ${TILES}, BOARD = ${BOARD};
   var PALETTE = ${JSON.stringify(PALETTE)};
   var cv = document.getElementById("board");
   var cx = cv.getContext("2d");
@@ -691,7 +732,7 @@ const PLACE_HTML = `<!doctype html>
       color = i;
       pal.querySelectorAll(".pal").forEach(function (x) { x.classList.remove("on"); });
       b.classList.add("on");
-      if (typeof drawCursor === "function") drawCursor();
+      drawCursor();
     };
     pal.appendChild(b);
   });
@@ -888,13 +929,14 @@ const PLACE_HTML = `<!doctype html>
       note("cooldown \\u2014 next pixel in " + Math.ceil((nextAt - Date.now()) / 1000) + "s");
       return;
     }
+    var col = color;   // capture: palette may change while the request flies
     fetch("/place/px", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ x: x, y: y, c: color }),
+      body: JSON.stringify({ x: x, y: y, c: col }),
     }).then(function (r) { return r.json(); }).then(function (r) {
       if (r.ok) {
-        px(x, y, color);
+        px(x, y, col);
         nextAt = r.next;
         el("m-placed").textContent = r.placed;
         cbox.classList.remove("pop");
@@ -938,7 +980,7 @@ const PLACE_HTML = `<!doctype html>
       el("cooltext").textContent = Math.ceil(left / 1000) + "s";
       el("m-next").textContent = Math.ceil(left / 1000) + "s";
     }
-    if (typeof drawCursor === "function") drawCursor();
+    drawCursor();
   }, 250);
 
   // --- me ------------------------------------------------------------------
@@ -970,18 +1012,26 @@ const PLACE_HTML = `<!doctype html>
     return "/place/frame/" + tx + "/" + ty + "/" + seq + (full ? ".full" : "") + ".bin";
   }
 
+  function fetchOk(url) {
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error("http " + r.status);
+      return r;
+    });
+  }
   function tileLoop(tx, ty) {
     var row = tileRow(tx, ty);
     var mySeq = -1;
     function tick() {
-      fetch("/place/manifest/" + tx + "/" + ty + ".bin", { cache: "no-store" })
+      // The whole update chain is returned, so a poll never overlaps a
+      // half-applied previous one and every failure lands in the catch.
+      fetchOk("/place/manifest/" + tx + "/" + ty + ".bin")
         .then(function (r) {
           var st = cdnStatus(r);
           return r.json().then(function (man) { return { man: man, st: st }; });
         })
         .then(function (res) {
           var man = res.man;
-          row[1].textContent = man.meta.pixels;
+          row[1].textContent = man.meta.placements;
           row[2].textContent = man.seq;
           row[3].textContent = man.meta.activations;
           if (res.st) row[4].textContent = res.st;
@@ -992,18 +1042,22 @@ const PLACE_HTML = `<!doctype html>
           var contiguous = chain.length && chain[0].from === mySeq;
           var start = (mySeq >= 0 && contiguous)
             ? Promise.resolve(mySeq)
-            : fetch(frameUrl(tx, ty, man.full, true))
+            : fetchOk(frameUrl(tx, ty, man.full, true))
                 .then(function (r) {
                   logPipe("t:" + tx + "," + ty, "full frame seq " + man.full + " (32KB)", cdnStatus(r));
                   return r.arrayBuffer();
                 })
-                .then(function (b) { drawFull(tx, ty, b); return man.full; });
+                .then(function (b) {
+                  if (b.byteLength !== TILE * TILE / 2) throw new Error("bad full frame");
+                  drawFull(tx, ty, b);
+                  return man.full;
+                });
 
-          start.then(function (at) {
+          return start.then(function (at) {
             var todo = man.diffs.filter(function (d) { return d.from >= at; });
             return todo.reduce(function (p, d) {
               return p.then(function () {
-                return fetch(frameUrl(tx, ty, d.seq, false)).then(function (r) {
+                return fetchOk(frameUrl(tx, ty, d.seq, false)).then(function (r) {
                   var st = cdnStatus(r);
                   return r.arrayBuffer().then(function (b) {
                     var n = drawDiff(tx, ty, b);
@@ -1014,7 +1068,7 @@ const PLACE_HTML = `<!doctype html>
             }, Promise.resolve()).then(function () { mySeq = man.seq; });
           });
         })
-        .catch(function () {})
+        .catch(function () { row[4].textContent = "err"; })
         .then(function () { setTimeout(tick, 1000); });
     }
     tick();
