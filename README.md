@@ -73,8 +73,19 @@ export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=
 export PATH="$PWD/node_modules/.bin:$PATH"
 
 celld deploy . --bucket s3://cells --endpoint http://127.0.0.1:9000
-celld --bucket s3://cells --endpoint http://127.0.0.1:9000 --listen 127.0.0.1:8080
+CELLD_DURABILITY=bucket \
+  celld --bucket s3://cells --endpoint http://127.0.0.1:9000 --listen 127.0.0.1:8080
 ```
+
+`CELLD_DURABILITY=bucket` matters on a **single** node (celld ≥ 0.3.0): the
+default `fleet` mode acks writes after peer fsync and uploads to the bucket
+behind — with only one node the "fleet" is the node itself, and a restart
+generates a new node-session id that cannot reclaim the previous session's
+write-behind log, stranding acked writes (`RestoreFailed: transaction not
+available`). `bucket` mode restores the ack-after-bucket-PUT guarantee; writes
+survive `kill -9`. With two or more nodes, drop the variable and the
+replicated write-behind log gives ~10× faster writes and ~100× fewer Class A
+ops with the same RPO = 0.
 
 Open <http://127.0.0.1:8080/>. The code is a standard Wrangler project
 (`wrangler.jsonc` is the config format celld reads), so it also runs unchanged
